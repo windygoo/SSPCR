@@ -6,7 +6,7 @@ An official implementation of paper "Semi-Supervised Cell Recognition under Poin
 
 Two choices.
 
-- You can download the raw data from [CoNIC](https://conic-challenge.grand-challenge.org/) to **datasets/conic** folder and then run this [script](https://github.com/windyzy/SSPCR/blob/main/datasets/conic/prepare_data.py)) to obtain training/validation/test subsets . 
+- You can download the raw data from [CoNIC](https://conic-challenge.grand-challenge.org/) to **datasets/conic** folder and then run this [script](https://github.com/windyzy/SSPCR/blob/main/datasets/conic/prepare_data.py) to obtain training/validation/test subsets . 
 - A more convenient way is to download the ready-made data subsets from Google Drive (after review).
 
 
