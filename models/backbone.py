@@ -252,14 +252,11 @@ class Backbone(nn.Module):
         from models.fpn import FPN
         self.neck = FPN(in_channels=[256, 512, 1024, 2048],
                         out_channel=256,
-                        num_outs=4)
+                        num_outs=3)
 
     def forward(self, images):
         xs = self.backbone(images)
 
-        # return [xs['p2'], xs['p3'], xs['p4']]
-
-        # return list(xs.values())
         out = self.neck(xs)
         return out
 

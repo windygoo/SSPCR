@@ -17,7 +17,7 @@ class FPN(nn.Module):
             self.lateral_convs.append(lateral_conv)
             # self.fpn_convs.append(fpn_conv)
 
-            if i < 4:
+            if i < 3:
                 self.fpn_convs.append(fpn_conv)
 
         # fpn_conv = nn.Conv2d(2048, 256, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
@@ -46,7 +46,7 @@ class FPN(nn.Module):
             self.fpn_convs[0](laterals[0]),
             self.fpn_convs[1](laterals[1]),
             self.fpn_convs[2](laterals[2]),
-            self.fpn_convs[3](laterals[3])
+            # self.fpn_convs[3](laterals[3])
         ]
 
         return outs

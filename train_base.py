@@ -1,6 +1,8 @@
+import os
 import sys
 import copy
 
+import numpy as np
 import wandb
 import argparse
 
@@ -18,7 +20,9 @@ from transforms import Preprocessing
 from matcher import build_matcher
 from dataset import build_dataloader
 from criterion import build_criterion
-from models import build_model
+# from models.dpa_p2pnet import build_model
+from p2pnet import build_model
+# from cltr import build_model
 
 from torch.nn.parallel import DistributedDataParallel
 
@@ -74,7 +78,7 @@ def get_args_parser():
                         help="Class coefficient in the matching cost")
 
     # * Model
-    parser.add_argument('--space', default=8, type=int)
+    parser.add_argument('--space', default=8, type=float)
     parser.add_argument('--num_classes', type=int, default=6,
                         help="Number of cell categories")
     parser.add_argument('--dropout', default=0.1, type=float,
@@ -86,12 +90,23 @@ def get_args_parser():
     parser.add_argument('--frozen_weights', type=str, default=None,
                         help="Path to the pretrained model. If set, only the mask head will be trained")
 
+    # * for CLTR Model
+    parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
+                        help="Type of positional embedding to use on top of the image features")
+    parser.add_argument('--enc_layers', default=6, type=int,
+                        help="Number of encoding layers in the transformer")
+    parser.add_argument('--dim_feedforward', default=2048, type=int,
+                        help="Intermediate size of the feedforward layers in the transformer blocks")
+    parser.add_argument('--nheads', default=8, type=int,
+                        help="Number of attention heads inside the transformer's attentions")
+    parser.add_argument('--pre_norm', action='store_true')
+
     # * Dataset
     parser.add_argument('--dataset', default='pdl1', type=str)
     parser.add_argument('--num_workers', default=8, type=int)
 
     # * Evaluator
-    parser.add_argument('--match_dis', default=12, type=int)
+    parser.add_argument('--match_dis', default=20, type=int)
     parser.add_argument('--nms_thr', default=-1, type=int)
 
     # * Distributed training
@@ -123,33 +138,21 @@ def do_train():
     data_loaders = build_dataloader(args)
     matcher = build_matcher(args)
     criterion = build_criterion(rank, matcher, args)
-    optimizer1 = torch.optim.AdamW(model.stu_1.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    optimizer2 = torch.optim.AdamW(model.stu_2.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    estimator = Estimator(data_loaders['train'])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # load checkpoint
-    max_cls_f1 = load_checkpoint(args, model, optimizer1, optimizer2) if args.resume else 0
+    max_cls_f1 = load_checkpoint(args, model, optimizer) if args.resume else 0
 
-    ema_state_dict_1 = copy.deepcopy(model.tea_1.state_dict())
-    ema_state_dict_2 = copy.deepcopy(model.tea_2.state_dict())
-
-    learner = CoLearner()
     for epoch in range(args.start_epoch, args.epochs):
         model.train()
 
         log_info = {}
-        log_info, ema_state_dict_1 = train_one_epoch(model.stu_1, model.tea_2, data_loaders['train'], optimizer1, epoch,
-                                                     criterion, estimator, ema_state_dict_1, learner, rank, log_info)
-        log_info, ema_state_dict_2 = train_one_epoch(model.stu_2, model.tea_1, data_loaders['train'], optimizer2, epoch,
-                                                     criterion, estimator, ema_state_dict_2, learner, rank, log_info)
+        log_info = train_one_epoch(model.stu_1, data_loaders['train'], optimizer, epoch, criterion, rank, log_info)
 
-        model.tea_1.load_state_dict(ema_state_dict_1)
-        model.tea_2.load_state_dict(ema_state_dict_2)
+        if epoch >= args.start_eval:
+            save_model(epoch, args.output_dir, model, optimizer, max_cls_f1)
 
-        if epoch >= args.start_eval - 1:
-            save_model(epoch, args.output_dir, model, optimizer1, max_cls_f1, optimizer2=optimizer2)
-
-            metrics_tea_1, metrics_string_tea_1 = do_eval(model.tea_1,
+            metrics_tea_1, metrics_string_tea_1 = do_eval(model.stu_1,
                                                           data_loaders['val'],
                                                           epoch,
                                                           rank=rank,
@@ -157,25 +160,12 @@ def do_train():
                                                           match_dis=args.match_dis)
             log_info.update(dict(zip(["Tea_1 Det_P", "Tea_1 Det_R", "Tea_1 Det_F1"], metrics_tea_1['Det'])))
             log_info.update(dict(zip(["Tea_1 Cls_P", "Tea_1 Cls_R", "Tea_1 Cls_F1"], metrics_tea_1['Cls'])))
-            tea_1_f1 = metrics_tea_1['Cls'][-1]
-
-            metrics_tea_2, metrics_string_tea_2 = do_eval(model.tea_2,
-                                                          data_loaders['val'],
-                                                          epoch,
-                                                          rank=rank,
-                                                          nms_thr=args.nms_thr,
-                                                          match_dis=args.match_dis)
-            log_info.update(dict(zip(["Tea_2 Det_P", "Tea_2 Det_R", "Tea_2 Det_F1"], metrics_tea_2['Det'])))
-            log_info.update(dict(zip(["Tea_2 Cls_P", "Tea_2 Cls_R", "Tea_2 Cls_F1"], metrics_tea_2['Cls'])))
-            tea_2_f1 = metrics_tea_2['Cls'][-1]
+            tea_1_f1 = metrics_tea_1['分类'][-1]
 
             if rank == 0:
-                cls_f1 = max(tea_1_f1, tea_2_f1)
-                if cls_f1 > max_cls_f1:
-                    max_cls_f1 = cls_f1
-                    save_model(epoch, args.output_dir, model, optimizer1, max_cls_f1,
-                               metrics_string_tea_1 if tea_1_f1 > tea_2_f1 else metrics_string_tea_2, mode='best',
-                               optimizer2=optimizer2)
+                if tea_1_f1 > max_cls_f1:
+                    max_cls_f1 = tea_1_f1
+                    save_model(epoch, args.output_dir, model, optimizer, max_cls_f1, metrics_string_tea_1, mode='best')
 
         if rank == 0 and args.use_wandb:
             wandb.log(log_info, step=epoch)
@@ -184,13 +174,7 @@ def do_train():
         cleanup()
 
 
-def train_one_epoch(student, teacher, train_loader, optimizer, epoch, criterion, estimator, ema_state_dict,
-                    learner, rank, log_info):
-    semi_sup_start = args.enable_semi_sup and epoch >= args.burn_up
-
-    if semi_sup_start:
-        score_thr, _ = estimator.eval_score_thr(teacher)
-
+def train_one_epoch(student, train_loader, optimizer, epoch, criterion, rank, log_info):
     if args.distributed:
         train_loader.sampler.set_epoch(epoch)
 
@@ -199,8 +183,8 @@ def train_one_epoch(student, teacher, train_loader, optimizer, epoch, criterion,
         iterator = tqdm(train_loader, file=sys.stdout)
         iterator.set_description(f"Train epoch-{epoch}")
 
-    u_data = train_loader.dataset.external_data
     for data_iter_step, (labeled_images, points, labels, lengths) in enumerate(iterator):
+        # warmup lr
         labeled_images = labeled_images.cuda(rank)
         points = points.cuda(rank)
         labels = labels.cuda(rank)
@@ -213,32 +197,9 @@ def train_one_epoch(student, teacher, train_loader, optimizer, epoch, criterion,
         outputs = student(labeled_images)
         losses = criterion(outputs, targets, branch='sup')
 
-        if semi_sup_start:
-            inds = np.random.choice(range(len(u_data)), args.batch_size, replace=False)
-            u_sampled_data = [u_data[ind] for ind in inds]
-
-            student_inputs = []
-            pseudo_targets = dict(zip(targets.keys(), [[] for _ in range(3)]))
-            for u_sample in u_sampled_data:
-                res = learner.make_pseudo_labels(teacher, u_sample, score_thr, rank)
-
-                student_inputs.append(res[0])
-                pseudo_targets['gt_nums'].append(res[1])
-                pseudo_targets['gt_points'].append(res[2])
-                pseudo_targets['gt_labels'].append(res[3])
-
-            outputs = student(torch.stack(student_inputs))
-            un_sup_losses = criterion(outputs, pseudo_targets, branch='un_sup')
-            losses.update(un_sup_losses)
-
         optimizer.zero_grad()
         sum(losses.values()).backward()
         optimizer.step()
-
-        # update the teacher model in the EMA manner
-        ema_state_dict = update_teacher_model(student,
-                                              ema_state_dict,
-                                              data_iter_step + len(iterator) * epoch)
 
         gathered_losses = torch.stack(list(losses.values()))
         if args.distributed:
@@ -248,7 +209,7 @@ def train_one_epoch(student, teacher, train_loader, optimizer, epoch, criterion,
         for k, v in zip(losses.keys(), gathered_losses):
             log_info[k] = log_info.get(k, 0) + v.item()
 
-    return log_info, ema_state_dict
+    return log_info
 
 
 def do_eval(model,
@@ -256,7 +217,7 @@ def do_eval(model,
             epoch=0,
             rank=0,
             nms_thr=-1,
-            match_dis=12,
+            match_dis=20,
             calc_map=False,
             eps=1e-6):
     model.eval()
@@ -344,6 +305,8 @@ def do_eval(model,
 
     table.add_row(['---'] * 4)
 
+    print(cls_f1.mean(1))
+
     det_p, det_r, det_f1 = det_p.mean().item(), det_r.mean().item(), det_f1.mean().item()
     cls_p, cls_r, cls_f1 = cls_p.mean().item(), cls_r.mean().item(), cls_f1.mean().item()
 
@@ -375,154 +338,12 @@ def update_teacher_model(student_model, ema_state_dict, global_step):
     return new_teacher_dict
 
 
-class Estimator:
-    def __init__(self, data_loader_train):
-        cell_nums = np.zeros(args.num_classes)
-        self.trans = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-        ])
-
-        l_data = data_loader_train.dataset.data
-        u_data = data_loader_train.dataset.external_data
-        u_data = u_data[:500]
-
-        for sample in l_data:
-            for i, pts in enumerate(list(sample.values())[1:]):
-                cell_nums[i] += len(pts)
-
-        self.u_data = u_data
-        self.desired_cell_nums = cell_nums * len(u_data) / len(l_data)
-
-    @torch.no_grad()
-    def eval_score_thr(self, model):
-        model.eval()
-
-        C = args.num_classes
-
-        pred_scores = [[] for _ in range(C)]
-        pred_cell_nums = np.zeros(C)
-
-        for sample in self.u_data:
-            inp = self.trans(sample['image'])[None].cuda()
-            scores, classes = predict(model, inp)[1:]
-
-            for c in range(C):
-                pred_scores[c] += scores[classes == c, c].tolist()
-                pred_cell_nums[c] += (classes == c).sum()
-
-        cls_thr = np.zeros(C)
-        for c in range(C):
-            num = int(self.desired_cell_nums[c])
-            pred_scores[c].sort(reverse=True)
-            try:
-                cls_thr[c] = pred_scores[c][num]
-            except IndexError:
-                cls_thr[c] = 1 / (C + 1)
-
-        cls_ratio = pred_cell_nums / pred_cell_nums.sum()
-
-        print(f'class-specific thresholds: {cls_thr}')
-        return cls_thr, cls_ratio
-
-
-class CoLearner(nn.Module):
-    def __init__(self):
-        super(CoLearner, self).__init__()
-        self.trans = transforms.Compose([transforms.ToTensor(),
-                                         transforms.Normalize((0.485, 0.456, 0.406),
-                                                              (0.229, 0.224, 0.225))])
-        self.keys = ['image', 'keypoints'] + [f'keypoints{i}' for i in range(1, args.num_classes)]
-
-        # strong augmentation
-        additional_targets = {}
-        for i in range(1, args.num_classes):
-            additional_targets.update({'keypoints%d' % i: 'keypoints'})
-        strong_aug = A.Compose([
-            # A.PadIfNeeded(min_height=1024, min_width=1024, border_mode=0, value=0),
-            A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8),
-            A.GaussianBlur(sigma_limit=(0.1, 2.0), p=0.5)
-        ], p=1, keypoint_params=A.KeypointParams(format='xy'), additional_targets=additional_targets)
-        self.strong_aug = Preprocessing(augmentor=strong_aug)
-
-    @torch.no_grad()
-    def make_pseudo_labels(self, net, u_sample, score_thr, rank):
-        h, w = u_sample['image'].shape[:2]
-        inp = self.trans(u_sample['image']).unsqueeze(0).cuda(rank)
-
-        hn, wn = int(np.ceil(h / args.space)), int(np.ceil(w / args.space))
-        if random.random() < 0.5:
-            outputs = net(inp)
-            points = outputs['pred_coords'][0]
-            scores = outputs['pred_logits'][0].softmax(-1)
-
-        else:
-            hf_inp = torch.flip(inp, [3])
-
-            outputs = net(hf_inp)
-            points = outputs['pred_coords'][0]
-            scores = outputs['pred_logits'][0].softmax(-1)
-
-            points = points.view(hn, wn, -1)
-            points = torch.flip(points, [1])
-            points[..., 0] = w - 1 - points[..., 0]
-            points = points.view(hn * wn, -1)
-
-            scores = scores.view(hn, wn, -1)
-            scores = torch.flip(scores, [1]).view(hn * wn, -1)
-
-        points = points.cpu().numpy()
-        scores = scores.cpu().numpy()
-
-        valid_flag = (points[:, 0] >= 0) & (points[:, 0] < w) & \
-                     (points[:, 1] >= 0) & (points[:, 1] < h) & \
-                     (scores.argmax(-1) < args.num_classes)
-
-        points = points[valid_flag]
-        scores = scores[valid_flag]
-
-        classes = scores.argmax(-1)
-        _reserved = np.ones_like(classes, dtype=bool)
-        for i in range(args.num_classes):
-            _reserved[classes == i] &= (scores[classes == i, i] >= score_thr[i])
-
-        pred_coords = points[_reserved]
-        pred_classes = classes[_reserved]
-
-        sample = [u_sample['image']] + \
-                 [pred_coords[pred_classes == c] for c in range(args.num_classes)]
-        sample = dict(zip(self.keys, sample))
-        sample = self.strong_aug(sample)
-
-        img = sample[0].cuda(rank)
-
-        gt_nums = len(sample[2])
-        gt_points = sample[1].view(-1, 2).float().cuda(rank)
-        gt_labels = sample[2].long().cuda(rank)
-
-        return img, gt_nums, gt_points, gt_labels
-
-
 class Models(nn.Module):
     def __init__(self, rank=0):
         super(Models, self).__init__()
 
         stu_1 = build_model(args).cuda(rank)
-        stu_2 = build_model(args).cuda(rank)
-
-        tea_1 = copy.deepcopy(stu_1)
-        for param in tea_1.parameters():
-            param.requires_grad = False
-
-        tea_2 = copy.deepcopy(stu_2)
-        for param in tea_2.parameters():
-            param.requires_grad = False
-
         self.stu_1 = stu_1
-        self.tea_1 = tea_1
-
-        self.stu_2 = stu_2
-        self.tea_2 = tea_2
 
 
 if __name__ == '__main__':
@@ -542,17 +363,15 @@ if __name__ == '__main__':
     # args.space = 8
     # args.ratio = 5
     # args.num_classes = 6
-    # args.dataset = 'conic'
-    # args.backbone = 'resnet50'
+    # args.dataset = 'conic'  # target dataset
+    # args.backbone = 'resnet50'  # target dataset
     # args.match_dis = 6
     #
     # model = Models()
     #
     # rank = args.gpu if args.distributed else 0
-    #
-    # ckpt = torch.load(f'./checkpoint/he_sup_5_semi/best.pth', map_location='cpu')
+    # ckpt = torch.load(f'./checkpoint/he_sup_5_base/best.pth', map_location='cpu')
     # print(ckpt['metrics'], ckpt['epoch'])
-    #
     # model.load_state_dict(ckpt.get('model', ckpt))
     # model.cuda(rank)
     #
@@ -560,8 +379,7 @@ if __name__ == '__main__':
     # test_sampler = DistributedSampler(dataset_test, shuffle=False) if args.distributed else None
     #
     # data_loader_test = DataLoader(dataset_test, batch_size=1, shuffle=False, num_workers=0, sampler=test_sampler)
-    # do_eval(model.tea_1, data_loader_test, nms_thr=args.nms_thr, rank=rank, match_dis=args.match_dis)
-    # do_eval(model.tea_2, data_loader_test, nms_thr=args.nms_thr, rank=rank, match_dis=args.match_dis)
+    # do_eval(model.stu_1, data_loader_test, nms_thr=args.nms_thr, rank=rank, match_dis=args.match_dis)
     #
     # if args.distributed:
     #     cleanup()
