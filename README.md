@@ -38,7 +38,7 @@ python train_base.py --dataset conic --space 8 --num_classes 6 --match_dis 6 --r
 To test models trained using our framework, run
 
 ```python
-python train_semi.py --dataset conic --space 8 --num_classes 6 --match_dis 6 --ratio 5 -test
+python train_semi.py --dataset conic --space 8 --num_classes 6 --match_dis 6 --ratio 5 --test
 ```
 
 
