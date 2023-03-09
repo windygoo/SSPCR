@@ -1,28 +1,20 @@
-import os
 import sys
-import copy
 
-import numpy as np
 import wandb
 import argparse
 
 import prettytable as pt
-import albumentations as A
 import torch.backends.cudnn as cudnn
-import torchvision.transforms as transforms
 
 from utils import *
 from tqdm import tqdm
 from eval_map import eval_map
 from mmdet.core import multi_apply
-from transforms import Preprocessing
 
 from matcher import build_matcher
 from dataset import build_dataloader
 from criterion import build_criterion
-# from models.dpa_p2pnet import build_model
-from p2pnet import build_model
-# from cltr import build_model
+from models import build_model
 
 from torch.nn.parallel import DistributedDataParallel
 
@@ -106,6 +98,7 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=8, type=int)
 
     # * Evaluator
+    parser.add_argument('--test', action='store_true')
     parser.add_argument('--match_dis', default=20, type=int)
     parser.add_argument('--nms_thr', default=-1, type=int)
 
@@ -354,32 +347,28 @@ if __name__ == '__main__':
     set_seed(args)
     cudnn.benchmark = True
 
-    do_train()
+    if not args.test:
 
-    # from dataset import build_dataset
-    # from torch.utils.data import DataLoader
-    # from torch.utils.data.distributed import DistributedSampler
-    #
-    # args.space = 8
-    # args.ratio = 5
-    # args.num_classes = 6
-    # args.dataset = 'conic'  # target dataset
-    # args.backbone = 'resnet50'  # target dataset
-    # args.match_dis = 6
-    #
-    # model = Models()
-    #
-    # rank = args.gpu if args.distributed else 0
-    # ckpt = torch.load(f'./checkpoint/he_sup_5_base/best.pth', map_location='cpu')
-    # print(ckpt['metrics'], ckpt['epoch'])
-    # model.load_state_dict(ckpt.get('model', ckpt))
-    # model.cuda(rank)
-    #
-    # dataset_test = build_dataset(args, 'test')
-    # test_sampler = DistributedSampler(dataset_test, shuffle=False) if args.distributed else None
-    #
-    # data_loader_test = DataLoader(dataset_test, batch_size=1, shuffle=False, num_workers=0, sampler=test_sampler)
-    # do_eval(model.stu_1, data_loader_test, nms_thr=args.nms_thr, rank=rank, match_dis=args.match_dis)
-    #
-    # if args.distributed:
-    #     cleanup()
+        do_train()
+
+    else:
+        from dataset import build_dataset
+        from torch.utils.data import DataLoader
+        from torch.utils.data.distributed import DistributedSampler
+
+        model = Models()
+
+        rank = args.gpu if args.distributed else 0
+        ckpt = torch.load(f'./checkpoint/{args.dataset}_sup_{args.ratio}_base/best.pth', map_location='cpu')
+        print(ckpt['metrics'], ckpt['epoch'])
+        model.load_state_dict(ckpt.get('model', ckpt))
+        model.cuda(rank)
+
+        dataset_test = build_dataset(args, 'test')
+        test_sampler = DistributedSampler(dataset_test, shuffle=False) if args.distributed else None
+
+        data_loader_test = DataLoader(dataset_test, batch_size=1, shuffle=False, num_workers=0, sampler=test_sampler)
+        do_eval(model.stu_1, data_loader_test, nms_thr=args.nms_thr, rank=rank, match_dis=args.match_dis)
+
+        if args.distributed:
+            cleanup()
