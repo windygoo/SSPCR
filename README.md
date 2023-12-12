@@ -1,4 +1,4 @@
-Official implementation of paper "Semi-Supervised Cell Recognition under Point Supervision"
+Official implementation of our paper "Semi-Supervised Cell Recognition under Point Supervision"
 
 
 
